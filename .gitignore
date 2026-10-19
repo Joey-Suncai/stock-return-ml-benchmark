@@ -1,0 +1,8 @@
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+all_stocks_5yr.csv
+econ491_paper.html
+econ491_paper_cache/
+econ491_paper_files/

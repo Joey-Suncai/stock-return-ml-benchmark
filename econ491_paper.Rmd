@@ -1,0 +1,512 @@
+---
+title: "Machine Learning Prediction of Short-Term U.S. Stock Returns"
+author: "Caijunyi Sun, Cindy Wang, Jinxu Han"
+date: "May 2026"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    toc_depth: 2
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = FALSE,
+  message    = FALSE,
+  warning    = FALSE,
+  cache      = FALSE,
+  cache.lazy = FALSE,
+  fig.align  = "center",
+  fig.width  = 6,
+  fig.height = 4
+)
+```
+
+```{r libraries, cache=FALSE}
+library(data.table)
+library(ggplot2)
+library(glmnet)
+library(ranger)
+library(knitr)
+library(kableExtra)
+library(corrplot)
+library(leaps)   
+library(pls)     
+library(gbm)    
+
+set.seed(42)
+```
+
+\newpage
+
+# Introduction
+
+Stock return prediction is one of the most studied problems in empirical finance. The efficient markets hypothesis (EMH) suggests that asset prices fully reflect all available information, implying that excess returns should be unpredictable (Fama, 1965). Despite this theoretical benchmark, a large empirical literature documents that past prices, trading volume, and technical indicators exhibit modest predictive power—particularly over short horizons. This project investigates whether machine learning (ML) methods can improve the prediction of one-day-ahead U.S. stock returns relative to a standard linear regression benchmark.
+
+The motivation for this approach comes from Mullainathan and Spiess (2017), who argue that ML is especially valuable in predictive settings because it automates variable selection and controls overfitting when many correlated predictors are available. Stock return prediction fits this description: the universe of potential predictors is large, returns are very noisy, and in-sample overfitting is a first-order concern. We use a dataset of 505 U.S. stocks over five years (2013–2018) and evaluate ten methods: Ordinary Least Squares (OLS), Best Subset Selection, Forward Stepwise Selection, Backward Stepwise Selection, Ridge Regression, LASSO, Principal Components Regression (PCR), Bagging, Random Forest, and Boosting.
+
+Our analysis proceeds in three steps. First, we construct ten technical predictors from daily price and volume data. Second, we train all models on data through 2016 and evaluate out-of-sample performance in 2017–2018. Third, we compare test-set MSE across methods and interpret which predictors drive performance.
+
+# Literature Review
+
+The predictability of stock returns has a long history in financial economics. Fama (1965) proposed the efficient markets hypothesis, arguing that price changes should be random and unpredictable. Subsequent work qualified this view: Lo and MacKinlay (1988) found significant positive autocorrelation in weekly U.S. stock returns, and Jegadeesh and Titman (1993) documented robust momentum effects at horizons of three to twelve months—stocks with recent high returns tend to outperform in the near term.
+
+More recent work has examined whether machine learning methods can improve return forecasting. Gu, Kelly, and Xiu (2020) conducted a comprehensive comparison of ML methods for U.S. stock return prediction and found that tree-based models and neural networks substantially outperform linear models when evaluated over a broad set of predictors. Their study emphasizes the importance of nonlinear interactions and the predictive value of volatility-related variables. Our project is a scaled-down application of this research agenda, focusing on a parsimonious set of technical indicators and methods explicitly covered in this course.
+
+Mullainathan and Spiess (2017) provide the conceptual framework for our analysis. They argue that the primary contribution of ML in economics is disciplined prediction—specifically, the ability to handle many correlated predictors without overfitting via regularization and cross-validation. Ridge and LASSO regression are textbook examples of this approach. Taddy (2019) further elaborates how these tools apply in business and economic contexts, emphasizing the role of penalized regression in high-dimensional prediction.
+
+A limitation of our study, shared by much of the literature, is that predicting raw returns is extremely difficult because the signal-to-noise ratio is very low. The primary goal of this paper is therefore not to find a "winning" strategy but to compare how different ML methods behave when the predictable component of returns is small—a setting where regularization and variable selection should matter most.
+
+# Data
+
+## Dataset Description
+
+The dataset is `all_stocks_5yr.csv`, which contains daily trading information for 505 U.S. stocks (S\&P 500 constituents) from February 8, 2013 to February 7, 2018. The raw dataset has 619,040 stock-day observations with seven columns: `date`, `open`, `high`, `low`, `close`, `volume`, and `Name`. The data are sourced from Kaggle.^[https://www.kaggle.com/datasets/rohitjain454/all-stocks-5yr]
+
+## Feature Construction
+
+We construct ten predictors from the daily price and volume data. All features use only information available at the close of trading day $t$, ensuring no look-ahead bias. The response variable is the next-day percentage return:
+
+$$r_{i,t+1} = 100 \times \frac{\text{close}_{i,t+1} - \text{close}_{i,t}}{\text{close}_{i,t}}$$
+
+The ten predictors are defined in Table 1 below.
+
+| Variable | Definition |
+|---|---|
+| `lag_ret` | $100 \times (\text{close}_t / \text{close}_{t-1} - 1)$, today's return |
+| `intraday_ret` | $100 \times (\text{close}_t / \text{open}_t - 1)$ |
+| `hl_spread` | $100 \times (\text{high}_t - \text{low}_t) / \text{open}_t$ |
+| `lag_volume` | $\text{volume}_{t-1}$ |
+| `ret_ma5` | Mean of $r_t, r_{t-1}, \ldots, r_{t-4}$ (5-day avg. return) |
+| `ret_ma20` | Mean of $r_t, r_{t-1}, \ldots, r_{t-19}$ (20-day avg. return) |
+| `ret_vol5` | Std. dev. of $r_t, \ldots, r_{t-4}$ (5-day volatility) |
+| `ret_vol20` | Std. dev. of $r_t, \ldots, r_{t-19}$ (20-day volatility) |
+| `vol_ma5` | Mean of $\text{volume}_t, \ldots, \text{volume}_{t-4}$ |
+| `vol_ma20` | Mean of $\text{volume}_t, \ldots, \text{volume}_{t-19}$ |
+
+Table: Predictor Variables
+
+```{r feature-engineering, cache=FALSE}
+dt <- fread("all_stocks_5yr.csv")
+dt[, date := as.Date(date)]
+setorder(dt, Name, date)
+
+dt[, ret      := (close / shift(close, 1, type = "lag") - 1) * 100, by = Name]
+dt[, next_ret := shift(ret, 1, type = "lead"),                       by = Name]
+
+dt[, lag_ret      := ret]
+dt[, intraday_ret := (close / open - 1) * 100]
+dt[, hl_spread    := (high  - low) / open * 100]
+dt[, lag_volume   := shift(volume, 1, type = "lag"), by = Name]
+
+dt[, ret_ma5  := frollmean(ret, 5,  align = "right"), by = Name]
+dt[, ret_ma20 := frollmean(ret, 20, align = "right"), by = Name]
+
+dt[, ret2 := ret^2]
+dt[, ret_vol5  := sqrt(pmax(0,  5/4  *
+  (frollmean(ret2, 5,  align = "right") - frollmean(ret, 5,  align = "right")^2))),
+   by = Name]
+dt[, ret_vol20 := sqrt(pmax(0, 20/19 *
+  (frollmean(ret2, 20, align = "right") - frollmean(ret, 20, align = "right")^2))),
+   by = Name]
+
+dt[, vol_ma5  := frollmean(volume, 5,  align = "right"), by = Name]
+dt[, vol_ma20 := frollmean(volume, 20, align = "right"), by = Name]
+
+feature_cols <- c("date", "Name", "next_ret",
+                  "lag_ret", "intraday_ret", "hl_spread", "lag_volume",
+                  "ret_ma5", "ret_ma20", "ret_vol5", "ret_vol20",
+                  "vol_ma5", "vol_ma20")
+panel <- dt[, .SD, .SDcols = feature_cols]
+panel <- na.omit(panel)
+```
+
+Features requiring a 20-day rolling window are undefined for the first 20 observations of each stock. After removing these and rows where `next_ret` is undefined (the last day of each stock's series), the final panel contains `r format(nrow(panel), big.mark=",")` observations.
+
+## Summary Statistics
+
+```{r summary-stats}
+num_vars <- c("next_ret", "lag_ret", "intraday_ret", "hl_spread", "lag_volume",
+              "ret_ma5", "ret_ma20", "ret_vol5", "ret_vol20",
+              "vol_ma5", "vol_ma20")
+
+stat_list <- lapply(num_vars, function(v) {
+  x <- panel[[v]]
+  data.frame(
+    Variable = v,
+    Mean     = round(mean(x),   4),
+    SD       = round(sd(x),     4),
+    Min      = round(min(x),    4),
+    Median   = round(median(x), 4),
+    Max      = round(max(x),    4)
+  )
+})
+stat_df <- do.call(rbind, stat_list)
+rownames(stat_df) <- NULL
+
+kable(stat_df,
+      caption  = "Summary Statistics",
+      booktabs = TRUE,
+      row.names = FALSE) |>
+  kable_styling(latex_options = c("hold_position", "scale_down"))
+```
+
+The response variable `next_ret` has a mean near zero, consistent with the efficient markets hypothesis, and a standard deviation of approximately `r round(sd(panel$next_ret), 2)` percentage points, reflecting substantial day-to-day variation. The volatility measures `ret_vol5` and `ret_vol20` are strictly non-negative and right-skewed, typical of financial risk measures. The volume variables (`lag_volume`, `vol_ma5`, `vol_ma20`) are highly right-skewed, reflecting the large variation in trading activity across stocks and time.
+
+```{r corr-plot, fig.cap="Correlation Matrix of Predictors", fig.height=5, fig.width=5}
+pred_vars <- c("lag_ret", "intraday_ret", "hl_spread", "lag_volume",
+               "ret_ma5", "ret_ma20", "ret_vol5", "ret_vol20",
+               "vol_ma5", "vol_ma20")
+
+samp_idx  <- sample(nrow(panel), 50000)
+corr_mat  <- cor(as.matrix(panel[samp_idx, ..pred_vars]))
+corrplot::corrplot(corr_mat, method = "color", type = "upper",
+         tl.cex = 0.7, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.55,
+         col = colorRampPalette(c("#2166AC","white","#B2182B"))(200))
+```
+
+Figure 1 shows that the two moving-average return series (`ret_ma5`, `ret_ma20`) are highly correlated with each other and with `lag_ret`, as expected. Similarly, the volume moving averages are highly correlated. This multicollinearity is precisely the setting where regularization (Ridge, LASSO) is expected to outperform OLS.
+
+# Methodology
+
+## Train/Test Split
+
+```{r split, cache=FALSE}
+train <- panel[date <= as.Date("2016-12-31")]
+test  <- panel[date >  as.Date("2016-12-31")]
+
+train_df <- as.data.frame(train[, .SD, .SDcols = c("next_ret", pred_vars)])
+test_df  <- as.data.frame(test[,  .SD, .SDcols = c("next_ret", pred_vars)])
+```
+
+We use a time-based split to preserve the temporal ordering of the data. Observations through December 31, 2016 form the **training set** (`r format(nrow(train_df), big.mark=",")` obs.) and observations from January 1, 2017 onward form the **test set** (`r format(nrow(test_df), big.mark=",")` obs.). This corresponds to roughly an 80/20 split by time. Random splitting would introduce look-ahead bias, as test-set stock returns would be correlated with training-set returns through shared market conditions.
+
+All model selection (stepwise AIC, regularization $\lambda$) is performed on the training set only. The test set is used solely for final evaluation.
+
+## Benchmark: OLS Regression
+
+The baseline model regresses `next_ret` on all ten predictors using ordinary least squares:
+
+$$r_{i,t+1} = \beta_0 + \sum_{j=1}^{10} \beta_j x_{ij,t} + \varepsilon_{i,t+1}$$
+
+With $n \approx 480{,}000$ observations and $p = 10$ predictors, OLS is unlikely to overfit severely. However, the high multicollinearity among predictors (see Figure 1) can inflate coefficient variance, motivating penalized alternatives.
+
+## Stepwise Selection
+
+Forward Stepwise Selection starts from a null (intercept-only) model and sequentially adds the predictor that most improves fit, stopping when AIC no longer decreases. Backward Stepwise Selection starts from the full ten-variable model and sequentially removes the least useful predictor. Both use the Akaike Information Criterion (AIC) to score each candidate model:
+
+$$\text{AIC} = -2\,\ell(\hat\beta) + 2p$$
+
+where $\ell(\hat\beta)$ is the log-likelihood and $p$ is the number of parameters. On large samples, AIC-based selection and cross-validation typically agree (Shao, 1997).
+
+## Ridge Regression
+
+Ridge regression adds an $L_2$ penalty to the OLS criterion:
+
+$$\hat\beta^{\text{ridge}} = \arg\min_\beta \left\{ \sum_{i=1}^n (y_i - x_i^\top\beta)^2 + \lambda \sum_{j=1}^p \beta_j^2 \right\}$$
+
+The penalty $\lambda \geq 0$ shrinks all coefficients toward zero but never sets them exactly to zero. Ridge is especially effective under multicollinearity. The tuning parameter $\lambda$ is selected by 10-fold cross-validation on the training set.
+
+## LASSO
+
+The LASSO replaces the $L_2$ penalty with an $L_1$ penalty:
+
+$$\hat\beta^{\text{lasso}} = \arg\min_\beta \left\{ \sum_{i=1}^n (y_i - x_i^\top\beta)^2 + \lambda \sum_{j=1}^p |\beta_j| \right\}$$
+
+The $L_1$ penalty induces exact sparsity: at the optimal $\lambda$, some coefficients are set to exactly zero, performing variable selection simultaneously with regularization. The tuning parameter $\lambda$ is selected by 10-fold cross-validation.
+
+## Random Forest
+
+A Random Forest builds $B$ decision trees on bootstrap samples of the training data and averages their predictions. At each split, only a random subset of $m = \lfloor\sqrt{p}\rfloor = 3$ predictors is considered, decorrelating the trees and reducing variance. The method can capture nonlinear effects and interactions that linear methods cannot. We fit $B = 500$ trees using the `ranger` package, and measure variable importance by permutation: the increase in out-of-bag MSE when a predictor's values are randomly shuffled.
+
+## Best Subset Selection
+
+Best Subset Selection evaluates all $2^p$ possible subsets of predictors and selects the one that minimizes a model-selection criterion. With $p = 10$ predictors, this requires evaluating $2^{10} = 1{,}024$ candidate models. We use the Bayesian Information Criterion (BIC) to select the optimal subset size:
+
+$$\text{BIC} = -2\,\ell(\hat\beta) + \log(n)\,p$$
+
+BIC penalizes complexity more heavily than AIC and is consistent in the large-$n$ setting, making it appropriate for our sample of $n \approx 480{,}000$ observations. We implement Best Subset Selection using the `leaps` package with `method = "exhaustive"`.
+
+## Principal Components Regression
+
+Principal Components Regression (PCR) is a dimension reduction method that first projects the predictors onto their principal components (PCs) and then regresses the response on the leading $M$ components. The PCs are linear combinations of the original predictors that capture the directions of maximum variance. PCR is especially useful when predictors are highly correlated, as the PCs are orthogonal by construction.
+
+We fit PCR using the `pls` package with all predictors standardized, and select the number of components $M$ by 10-fold cross-validation on the training set. The selected $M$ represents the smallest number of components that adequately captures the relevant predictive information.
+
+## Bagging
+
+Bagging (Bootstrap Aggregation) fits $B$ decision trees, each on an independent bootstrap sample of the training data, and averages the predictions. Unlike Random Forest, Bagging uses all $p = 10$ predictors at each split ($m = p$), so the trees are more correlated but individually have lower bias. We implement Bagging using `ranger` with `mtry = p`, fitting $B = 500$ trees. The out-of-bag (OOB) error serves as an approximately unbiased estimate of test error.
+
+## Boosting
+
+Boosting sequentially fits shallow decision trees to the residuals of the ensemble so far, gradually improving predictions in directions where the current model performs poorly. The Gradient Boosting Machine (GBM) of Friedman (2001) is the most widely used variant. We use the `gbm` package with a Gaussian loss function, interaction depth of 3, shrinkage parameter $\lambda = 0.05$, and up to 500 trees. The optimal number of trees is selected using out-of-bag error to avoid cross-validation overhead on the large training set.
+
+# Results
+
+## Model Estimation
+
+```{r ols, cache=FALSE}
+ols_fit       <- lm(next_ret ~ ., data = train_df)
+ols_pred      <- predict(ols_fit, newdata = test_df)
+ols_train_mse <- mean(ols_fit$residuals^2)
+ols_test_mse  <- mean((test_df$next_ret - ols_pred)^2)
+```
+
+```{r stepwise, cache=FALSE}
+null_mod <- lm(next_ret ~ 1, data = train_df)
+full_mod <- lm(next_ret ~ ., data = train_df)
+
+fwd_fit <- step(null_mod,
+                scope     = list(lower = null_mod, upper = full_mod),
+                direction = "forward",
+                trace     = 0)
+bwd_fit <- step(full_mod,
+                direction = "backward",
+                trace     = 0)
+
+fwd_pred      <- predict(fwd_fit, newdata = test_df)
+bwd_pred      <- predict(bwd_fit, newdata = test_df)
+fwd_train_mse <- mean(fwd_fit$residuals^2)
+bwd_train_mse <- mean(bwd_fit$residuals^2)
+fwd_test_mse  <- mean((test_df$next_ret - fwd_pred)^2)
+bwd_test_mse  <- mean((test_df$next_ret - bwd_pred)^2)
+```
+
+```{r glmnet-prep, cache=FALSE}
+X_train <- model.matrix(next_ret ~ ., data = train_df)[, -1]
+y_train <- train_df$next_ret
+X_test  <- model.matrix(next_ret ~ ., data = test_df)[, -1]
+y_test  <- test_df$next_ret
+```
+
+```{r ridge, cache=FALSE}
+set.seed(42)
+ridge_cv <- cv.glmnet(X_train, y_train, alpha = 0, nfolds = 10)
+
+ridge_train_pred <- as.vector(predict(ridge_cv, X_train, s = "lambda.min"))
+ridge_test_pred  <- as.vector(predict(ridge_cv, X_test,  s = "lambda.min"))
+ridge_train_mse  <- mean((y_train - ridge_train_pred)^2)
+ridge_test_mse   <- mean((y_test  - ridge_test_pred)^2)
+```
+
+```{r lasso, cache=FALSE}
+set.seed(42)
+lasso_cv <- cv.glmnet(X_train, y_train, alpha = 1, nfolds = 10)
+
+lasso_train_pred <- as.vector(predict(lasso_cv, X_train, s = "lambda.min"))
+lasso_test_pred  <- as.vector(predict(lasso_cv, X_test,  s = "lambda.min"))
+lasso_train_mse  <- mean((y_train - lasso_train_pred)^2)
+lasso_test_mse   <- mean((y_test  - lasso_test_pred)^2)
+```
+
+```{r best-subset, cache=FALSE}
+best_regsub <- regsubsets(next_ret ~ ., data = train_df,
+                          nvmax = 10, method = "exhaustive")
+best_bic    <- which.min(summary(best_regsub)$bic)
+
+predict_regsub <- function(obj, newdata, id) {
+  mat    <- model.matrix(next_ret ~ ., data = newdata)
+  coef_i <- coef(obj, id = id)
+  as.vector(mat[, names(coef_i)] %*% coef_i)
+}
+
+best_train_pred <- predict_regsub(best_regsub, train_df, best_bic)
+best_test_pred  <- predict_regsub(best_regsub, test_df,  best_bic)
+best_train_mse  <- mean((train_df$next_ret - best_train_pred)^2)
+best_test_mse   <- mean((test_df$next_ret  - best_test_pred)^2)
+```
+
+```{r pcr-fit, cache=FALSE}
+set.seed(42)
+pcr_fit        <- pcr(next_ret ~ ., data = train_df, scale = TRUE,
+                      validation = "CV", segments = 10)
+pcr_ncomp      <- which.min(RMSEP(pcr_fit)$val[1, 1, -1])
+pcr_train_pred <- as.vector(predict(pcr_fit, train_df, ncomp = pcr_ncomp))
+pcr_test_pred  <- as.vector(predict(pcr_fit, test_df,  ncomp = pcr_ncomp))
+pcr_train_mse  <- mean((train_df$next_ret - pcr_train_pred)^2)
+pcr_test_mse   <- mean((test_df$next_ret  - pcr_test_pred)^2)
+```
+
+```{r bagging, cache=FALSE}
+set.seed(42)
+bag_fit       <- ranger(next_ret ~ ., data = train_df,
+                        num.trees = 500, mtry = length(pred_vars), seed = 42)
+bag_test_pred  <- predict(bag_fit, data = test_df)$predictions
+bag_test_mse   <- mean((test_df$next_ret - bag_test_pred)^2)
+bag_train_pred <- predict(bag_fit, data = train_df)$predictions
+bag_train_mse  <- mean((train_df$next_ret - bag_train_pred)^2)
+```
+
+```{r boosting, cache=FALSE}
+set.seed(42)
+gbm_fit <- gbm(next_ret ~ ., data = train_df,
+               distribution      = "gaussian",
+               n.trees           = 500,
+               interaction.depth = 3,
+               shrinkage         = 0.05,
+               bag.fraction      = 0.5,
+               n.minobsinnode    = 20,
+               verbose           = FALSE)
+best_trees     <- gbm.perf(gbm_fit, method = "OOB", plot.it = FALSE)
+gbm_train_pred <- predict(gbm_fit, train_df, n.trees = best_trees)
+gbm_test_pred  <- predict(gbm_fit, test_df,  n.trees = best_trees)
+gbm_train_mse  <- mean((train_df$next_ret - gbm_train_pred)^2)
+gbm_test_mse   <- mean((test_df$next_ret  - gbm_test_pred)^2)
+```
+
+```{r random-forest, cache=FALSE}
+set.seed(42)
+rf_fit <- ranger(
+  next_ret  ~ .,
+  data      = train_df,
+  num.trees = 500,
+  mtry      = 3,
+  importance = "permutation",
+  seed      = 42
+)
+
+rf_test_pred  <- predict(rf_fit, data = test_df)$predictions
+rf_test_mse   <- mean((test_df$next_ret - rf_test_pred)^2)
+rf_train_pred <- predict(rf_fit, data = train_df)$predictions
+rf_train_mse  <- mean((train_df$next_ret - rf_train_pred)^2)
+```
+
+## Model Comparison
+
+```{r results-table}
+results <- data.frame(
+  Model = c("OLS", "Best Subset", "Forward Stepwise", "Backward Stepwise",
+            "Ridge", "LASSO", "PCR", "Bagging", "Random Forest", "Boosting"),
+  `Train MSE` = round(c(ols_train_mse, best_train_mse, fwd_train_mse, bwd_train_mse,
+                         ridge_train_mse, lasso_train_mse, pcr_train_mse,
+                         bag_train_mse, rf_train_mse, gbm_train_mse), 5),
+  `Test MSE`  = round(c(ols_test_mse, best_test_mse, fwd_test_mse, bwd_test_mse,
+                         ridge_test_mse, lasso_test_mse, pcr_test_mse,
+                         bag_test_mse, rf_test_mse, gbm_test_mse), 5),
+  check.names = FALSE
+)
+
+kable(results,
+      caption  = "Model Comparison: Training and Test MSE",
+      booktabs = TRUE,
+      row.names = FALSE) |>
+  kable_styling(latex_options = "hold_position") |>
+  row_spec(which.min(results$`Test MSE`), bold = TRUE)
+```
+
+```{r results-bar, fig.cap="Out-of-Sample Test MSE by Model"}
+ggplot(results, aes(x = reorder(Model, `Test MSE`), y = `Test MSE`)) +
+  geom_col(fill = "steelblue", alpha = 0.85, width = 0.6) +
+  coord_flip() +
+  labs(x = NULL,
+       y = "Test MSE",
+       title = "Out-of-Sample Prediction Error by Method") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+## Interpretation
+
+```{r best-model, include=FALSE, cache=FALSE}
+best_model    <- results$Model[which.min(results$`Test MSE`)]
+best_test_mse <- min(results$`Test MSE`)
+null_mse      <- var(test_df$next_ret)   # variance of response = naive "predict mean" MSE
+pct_improve   <- round(100 * (ols_test_mse - best_test_mse) / ols_test_mse, 2)
+```
+
+Table 2 reports training and test MSE for all ten models. All methods produce test MSE values close to the unconditional variance of next-day returns (`r round(null_mse, 4)`), which is the MSE of the trivial "predict the mean" baseline. This confirms the well-known difficulty of predicting individual stock returns.
+
+The best-performing model is **`r best_model`**, with a test MSE of `r best_test_mse`. This represents a `r pct_improve`% reduction relative to the OLS benchmark (test MSE = `r round(ols_test_mse, 5)`). While the absolute improvement is modest, it is consistent with the finding in Gu et al. (2020) that ML methods produce small but consistent gains over linear models in the presence of a weak signal.
+
+The variable selection methods (Best Subset, Forward, Backward Stepwise) produce similar results to OLS, suggesting that the full ten-variable specification does not overfit severely in this large-$n$ setting. PCR achieves a similar test MSE to OLS, indicating that the principal components of these predictors carry roughly the same aggregate predictive information as the original variables. Ridge and LASSO provide modest improvements by shrinking noisy coefficients. Among the tree-based ensemble methods, Bagging, Random Forest, and Boosting capture potential nonlinear patterns, with Boosting's sequential residual fitting sometimes yielding additional improvements. LASSO's variable selection is informative: it zeros out predictors with little marginal information, as discussed below.
+
+## LASSO Variable Selection
+
+```{r lasso-coef-table}
+lasso_coef    <- coef(lasso_cv, s = "lambda.min")
+coef_vals     <- as.vector(lasso_coef)[-1]
+coef_names    <- rownames(lasso_coef)[-1]
+
+lasso_coef_df <- data.frame(
+  Variable    = coef_names,
+  Coefficient = round(coef_vals, 6),
+  Status      = ifelse(abs(coef_vals) < 1e-8, "Zeroed out", "Retained")
+)
+lasso_coef_df <- lasso_coef_df[order(abs(lasso_coef_df$Coefficient),
+                                      decreasing = TRUE), ]
+
+kable(lasso_coef_df,
+      caption   = "LASSO Coefficients at Optimal Lambda",
+      booktabs  = TRUE,
+      row.names = FALSE) |>
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r lasso-path, fig.cap="LASSO Regularization Path (log-lambda scale)"}
+plot(lasso_cv$glmnet.fit, xvar = "lambda", label = TRUE,
+     main = "LASSO Coefficient Path")
+abline(v = -log(lasso_cv$lambda.min), lty = 2, col = "red", lwd = 1.5)
+legend("topright", legend = "CV-optimal lambda", lty = 2,
+       col = "red", bty = "n", cex = 0.8)
+```
+
+```{r n-retained, include=FALSE}
+n_retained <- sum(lasso_coef_df$Status == "Retained")
+n_zeroed   <- sum(lasso_coef_df$Status == "Zeroed out")
+```
+
+At the cross-validation-optimal $\lambda$, LASSO retains `r n_retained` predictor(s) and zeros out `r n_zeroed`. This parsimony reflects the weak and diffuse signal in stock returns. The predictors with the largest (absolute) coefficients are `r paste(lasso_coef_df$Variable[1:min(3, n_retained)], collapse=", ")`, consistent with the short-term momentum and volatility clustering documented in the literature.
+
+## Random Forest Variable Importance
+
+```{r rf-importance, fig.cap="Random Forest Variable Importance (Permutation)"}
+imp_df <- data.frame(
+  Variable   = names(rf_fit$variable.importance),
+  Importance = rf_fit$variable.importance
+)
+imp_df <- imp_df[order(imp_df$Importance, decreasing = TRUE), ]
+
+ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "coral", alpha = 0.85, width = 0.6) +
+  coord_flip() +
+  labs(x = NULL,
+       y = "Permutation Importance",
+       title = "Random Forest: Variable Importance") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+The permutation importance plot shows which predictors most reduce prediction error in the Random Forest. A higher value indicates that randomly shuffling that variable's values causes a larger increase in out-of-bag MSE, i.e., the model relies more heavily on that variable.
+
+The Random Forest ranking reveals a striking disagreement with LASSO. LASSO zeroed out all three volume variables (`lag_volume`, `vol_ma5`, `vol_ma20`), treating them as linearly uninformative. Yet in the Random Forest, these same variables rank among the top four most important predictors, behind only `lag_ret`. This divergence suggests that trading volume carries predictive information about next-day returns through **nonlinear relationships or interactions** with return variables—patterns that a linear model like LASSO cannot capture. The return-based predictors (`ret_ma5`, `intraday_ret`, `ret_vol5`) are important in both methods, offering consistent cross-method evidence of short-term momentum and volatility effects. The contrast between LASSO and Random Forest on volume variables thus highlights a key limitation of linear approaches in this setting.
+
+# Conclusion
+
+This paper compares ten machine learning methods—OLS, Best Subset, Forward Stepwise, Backward Stepwise, Ridge, LASSO, PCR, Bagging, Random Forest, and Boosting—for predicting next-day U.S. stock returns using daily price and volume data for 505 S\&P 500 stocks from 2013 to 2018. We find that all methods achieve similar out-of-sample test MSE, close to the unconditional variance of returns. The best-performing method, `r best_model`, reduces test MSE by `r pct_improve`% relative to OLS. These results are consistent with a near-efficient market where the predictable component of returns is small.
+
+The variable-selection methods (Best Subset, Forward, Backward) and the dimension-reduction approach (PCR) perform similarly to OLS, confirming that the relevant predictors are broadly known and that reducing the predictor set does not improve out-of-sample performance appreciably. The regularized methods—Ridge and LASSO—offer modest improvements by shrinking noisy coefficients. LASSO further identifies a sparse set of the most informative predictors. Among ensemble tree methods, Bagging, Random Forest, and Boosting capture potential nonlinear relationships; Boosting in particular can outperform linear methods when the response surface has interaction effects, though the gains remain modest in this near-efficient-market setting.
+
+Several limitations should be noted. First, our predictor set is limited to technical indicators; incorporating fundamental data, earnings surprises, or sentiment measures might improve prediction. Second, we pool all stocks without stock fixed effects, ignoring permanent differences in return means across firms. Third, our results do not account for transaction costs, which would erode any trading profits implied by the predictions. Fourth, the time-based train/test split means that all models are evaluated on a single historical period (2017–2018), which may not generalize to other market regimes.
+
+Future work could explore longer return horizons, cross-sectional sorting (predicting relative rather than absolute returns), or the application of deep learning methods to capture more complex nonlinear patterns.
+
+# References
+
+Fama, E. F. (1965). The behavior of stock-market prices. *Journal of Business*, 38(1), 34–105.
+
+Friedman, J. H. (2001). Greedy function approximation: A gradient boosting machine. *Annals of Statistics*, 29(5), 1189–1232.
+
+Gu, S., Kelly, B., & Xiu, D. (2020). Empirical asset pricing via machine learning. *Review of Financial Studies*, 33(5), 2223–2273.
+
+Jegadeesh, N., & Titman, S. (1993). Returns to buying winners and selling losers: Implications for stock market efficiency. *Journal of Finance*, 48(1), 65–91.
+
+Lo, A. W., & MacKinlay, A. C. (1988). Stock market prices do not follow random walks: Evidence from a simple specification test. *Review of Financial Studies*, 1(1), 41–66.
+
+Mullainathan, S., & Spiess, J. (2017). Machine learning: An applied econometric approach. *Journal of Economic Perspectives*, 31(2), 87–106.
+
+Shao, J. (1997). An asymptotic theory for linear model selection. *Statistica Sinica*, 7(2), 221–242.
+
+Taddy, M. (2019). *Business Data Science: Combining Machine Learning and Economics to Optimize, Automate, and Accelerate Business Decisions*. McGraw Hill.
