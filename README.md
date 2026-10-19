@@ -24,6 +24,8 @@ The comparison uses a single historical holdout and only technical indicators. T
 
 The input used for this release has 619,040 rows and seven columns (`date`, `open`, `high`, `low`, `close`, `volume`, `Name`). The R Markdown file runs without cached model results, so it recomputes all models and charts from the CSV.
 
+**Verification status:** An uncached local run completed data preparation and the linear models, then reached bagging. I stopped it after about 15 minutes of active tree training. The displayed values and comparison chart come from the original report's ten-model results table; this portfolio release has not been rerun end to end. The 500-tree bagging and random forest fits can take substantial time.
+
 ## Changes made for this portfolio release
 
 - Removed stale R Markdown caching after finding a chart that did not match the ten-model results table.
